@@ -13,20 +13,14 @@ import { incidentData, type Incident, type IncidentPriority } from '../data/inci
 import { recommendations, type Recommendation } from '../data/recommendationsData';
 import { MCPQuery } from './MCPQuery';
 import { GitHubCommit, githubService } from "@/services/github";
+import { openshiftService } from '../services/openshift';
+import { jiraService } from '../services/jira';
+import type { JiraIssue } from '../services/jira';
 
 interface Notification {
   message: string;
-}
-
-interface JiraIssue {
-  key: string;
-  fields: {
-    summary: string;
-    status: { name: string };
-    priority: { name: string };
-    assignee: { displayName: string };
-    created: string;
-  };
+  type: 'success' | 'error' | 'warning' | 'info';
+  timestamp: Date;
 }
 
 interface Message {
@@ -72,9 +66,9 @@ export default function IPEConsole() {
   const [filteredIncidents, setFilteredIncidents] = useState<Incident[]>(incidentData);
   const [searchTerm, setSearchTerm] = useState('');
   const [notifications, setNotifications] = useState<Notification[]>([
-    { message: "New critical incident reported" },
-    { message: "System health check completed" },
-    { message: "Backup process successful" }
+    { message: "New critical incident reported", type: 'error', timestamp: new Date() },
+    { message: "System health check completed", type: 'success', timestamp: new Date() },
+    { message: "Backup process successful", type: 'success', timestamp: new Date() }
   ]);
   const [message, setMessage] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -555,7 +549,7 @@ export default function IPEConsole() {
 
   const addNotification = (message: string) => {
     console.log("New notification:", message);
-    setNotifications([...notifications, { message }]);
+    setNotifications([...notifications, { message, type: 'info', timestamp: new Date() }]);
   };
 
   useEffect(() => {
@@ -638,40 +632,130 @@ export default function IPEConsole() {
     }
   };
 
-  const handleSendMessage = async () => {
-    if (!input.trim()) return;
-
-    const userMessage = input;
-    setInput('');
+  const handleMessage = async (userMessage: string) => {
+    if (!userMessage.trim()) return;
+    
     setMessages(prev => [...prev, { role: 'user', content: userMessage }]);
-
-    setIsLoading(true);
+    setInput('');
+    
     try {
-      // First try GitHub search
-      if (userMessage.toLowerCase().includes('github') || 
-          userMessage.toLowerCase().includes('commit') || 
-          userMessage.toLowerCase().includes('pr') || 
-          userMessage.toLowerCase().includes('issue')) {
+      const queryLower = userMessage.toLowerCase();
+      
+      // Handle JIRA queries
+      if (queryLower.includes('jira') || 
+          queryLower.includes('ticket') || 
+          queryLower.includes('issue')) {
+        setJiraQuery(userMessage);
+        setActiveTab('jira');
+        
+        setIsLoading(true);
+        try {
+          const results = await jiraService.searchIssues(userMessage);
+          setJiraIssues(results);
+          setJiraError(null);
+          
+          // Add response to chat
+          setMessages(prev => [...prev,
+            { role: 'assistant', content: 'I found these JIRA issues:\n\n' + results.map((issue: any) => 
+              `🎫 ${issue.key}: ${issue.fields.summary}\n` +
+              `Status: ${issue.fields.status.name}\n` +
+              `Priority: ${issue.fields.priority.name}\n` +
+              `Assignee: ${issue.fields.assignee?.displayName || 'Unassigned'}`
+            ).join('\n\n')}
+          ]);
+        } catch (error) {
+          console.error('JIRA search error:', error);
+          setJiraError('Failed to fetch JIRA issues. Please try again.');
+          setMessages(prev => [...prev,
+            { role: 'assistant', content: 'Sorry, I encountered an error while searching JIRA issues. Please try again.' }
+          ]);
+        } finally {
+          setIsLoading(false);
+        }
+        return;
+      }
+
+      // Handle GitHub queries
+      if (queryLower.includes('github') || 
+          queryLower.includes('commit') || 
+          queryLower.includes('pr')) {
         const results = await githubService.searchGitHub(userMessage);
         setMessages(prev => [...prev,
           { role: 'assistant', content: 'Here are the GitHub search results:\n\n' + results.map((commit: any) => 
             `📝 ${new Date(commit.commit.author.date).toLocaleDateString()} - ${commit.commit.message} (by ${commit.commit.author.name})`
           ).join('\n\n')}
         ]);
-      } else {
-        // Handle other types of queries
-        setMessages(prev => [...prev, 
-          { role: 'assistant', content: 'I understand you\'re asking about: ' + userMessage }
-        ]);
+        return;
       }
-    } catch (error) {
-      console.error("Error processing message:", error);
-      setMessages(prev => [...prev,
-        { role: 'assistant', content: 'Sorry, I encountered an error while processing your request. Please try again.' }
+
+      // Handle OpenShift queries
+      if (queryLower.includes('openshift') ||
+          queryLower.includes('cluster') ||
+          queryLower.includes('pod') ||
+          queryLower.includes('deployment')) {
+        const response = await openshiftService.processQuery(userMessage);
+        setMessages(prev => [...prev,
+          { role: 'assistant', content: response }
+        ]);
+        return;
+      }
+
+      // Handle MCP queries
+      if (queryLower.includes('mcp') ||
+          queryLower.includes('model') ||
+          queryLower.includes('protocol')) {
+        const mcpResponse = await handleMCPQuery(userMessage);
+        setMessages(prev => [...prev,
+          { role: 'assistant', content: mcpResponse }
+        ]);
+        return;
+      }
+
+      // Default response
+      setMessages(prev => [...prev, 
+        { role: 'assistant', content: 'I understand you\'re asking about: ' + userMessage + '\n\nTip: You can ask about:\n• JIRA (tickets, issues)\n• GitHub (commits, PRs)\n• OpenShift (pods, deployments)\n• Model Context Protocol (MCP)' }
       ]);
-    } finally {
-      setIsLoading(false);
+    } catch (error) {
+      console.error('Error processing message:', error);
+      setMessages(prev => [...prev,
+        { role: 'assistant', content: 'Sorry, I encountered an error processing your request. Please try again.' }
+      ]);
     }
+  };
+
+  const handleSendMessage = () => {
+    if (!input.trim()) return;
+    handleMessage(input);
+  };
+
+  const handleMCPQuery = async (query: string): Promise<string> => {
+    const queryLower = query.toLowerCase();
+    
+    if (queryLower.includes('system.metrics') || queryLower.includes('resource.utilization')) {
+      return `📊 System Metrics:\n\n` +
+        `CPU:\n` +
+        `• Usage: 78%\n` +
+        `• Cores: 16\n` +
+        `• Temperature: 45°C\n\n` +
+        `Memory:\n` +
+        `• Used: 24.5GB\n` +
+        `• Available: 32GB`;
+    }
+    
+    if (queryLower.includes('model.status') || queryLower.includes('model.health')) {
+      return `🤖 Model Status:\n\n` +
+        `• Status: Active\n` +
+        `• Health: 98%\n` +
+        `• Last Update: ${new Date().toLocaleString()}\n` +
+        `• Active Sessions: 12\n` +
+        `• Queue Length: 3`;
+    }
+    
+    return `🎯 Model Context Protocol Overview:\n\n` +
+      `1. System Status: Operational\n` +
+      `2. Active Models: 4\n` +
+      `3. Total Sessions: 15\n` +
+      `4. Average Response Time: 245ms`;
   };
 
   const handleSearch = async (query: string) => {
@@ -704,97 +788,6 @@ export default function IPEConsole() {
     return 'Medium' as IncidentPriority;
   };
 
-  const handleMCPQuery = () => {
-    setMcpLoading(true);
-    // Simulate query processing
-    setTimeout(() => {
-      const queryLower = mcpQuery.toLowerCase();
-      let result;
-
-      if (queryLower.includes('system.metrics') || queryLower.includes('resource.utilization')) {
-        result = {
-          type: 'metrics',
-          data: {
-            cpu: {
-              usage: '78%',
-              cores: 16,
-              temperature: '45°C'
-            },
-            memory: {
-              used: '24.5GB',
-              available: '32GB',
-              swap: '2GB'
-            },
-            disk: {
-              read: '250MB/s',
-              write: '180MB/s',
-              iops: 3500
-            }
-          }
-        };
-      }
-      else if (queryLower.includes('service.health')) {
-        result = {
-          type: 'health',
-          data: {
-            services: [
-              { name: 'API Gateway', status: 'healthy', uptime: '99.99%' },
-              { name: 'Auth Service', status: 'healthy', uptime: '99.95%' },
-              { name: 'Database', status: 'degraded', uptime: '99.80%' },
-              { name: 'Cache', status: 'healthy', uptime: '99.99%' }
-            ]
-          }
-        };
-      }
-      else if (queryLower.includes('network.latency') || queryLower.includes('response.times')) {
-        result = {
-          type: 'performance',
-          data: {
-            endpoints: [
-              { path: '/api/v1/users', p95: '120ms', p99: '250ms' },
-              { path: '/api/v1/orders', p95: '180ms', p99: '350ms' },
-              { path: '/api/v1/products', p95: '90ms', p99: '180ms' }
-            ]
-          }
-        };
-      }
-      else if (queryLower.includes('deployment.state')) {
-        result = {
-          type: 'deployment',
-          data: {
-            services: [
-              { name: 'Frontend', version: 'v2.1.0', replicas: '3/3' },
-              { name: 'Backend API', version: 'v1.9.2', replicas: '5/5' },
-              { name: 'Worker', version: 'v1.5.0', replicas: '2/2' }
-            ]
-          }
-        };
-      }
-      else if (queryLower.includes('security') || queryLower.includes('auth')) {
-        result = {
-          type: 'security',
-          data: {
-            status: 'secure',
-            lastScan: '2025-03-25 22:00:00',
-            findings: [
-              { severity: 'medium', description: 'TLS 1.2 in use, upgrade to 1.3 recommended' },
-              { severity: 'low', description: 'Non-critical headers missing' }
-            ]
-          }
-        };
-      }
-      else {
-        result = {
-          type: 'error',
-          message: 'Query not recognized. Please use one of the suggested queries.'
-        };
-      }
-
-      setMcpResult(result);
-      setMcpLoading(false);
-    }, 1000);
-  };
-
   const [isMCPModalOpen, setIsMCPModalOpen] = useState(false);
 
   const [githubSearchTerm, setGithubSearchTerm] = useState("");
@@ -812,7 +805,9 @@ export default function IPEConsole() {
       console.error("Search error:", error);
       // Add error notification
       setNotifications(prev => [...prev, {
-        message: "Error performing search. Please try again."
+        message: "Error performing search. Please try again.",
+        type: 'error',
+        timestamp: new Date()
       }]);
     } finally {
       setGithubSearchLoading(false);
@@ -1280,7 +1275,7 @@ export default function IPEConsole() {
                 <div className="p-4 border-t border-gray-700">
                   <div className="flex gap-2">
                     <Input
-                      placeholder="Ask about incidents or platform status..."
+                      placeholder="Ask about JIRA, GitHub, OpenShift, or other services..."
                       value={input}
                       onChange={(e) => setInput(e.target.value)}
                       className="bg-gray-700 border-gray-600 text-white placeholder-gray-400"
@@ -1296,7 +1291,7 @@ export default function IPEConsole() {
                       onClick={handleSendMessage}
                       disabled={isLoading || !input.trim()}
                     >
-                      {isLoading ? <RefreshCw className="w-4 h-4 animate-spin" /> : 'Send'}
+                      {isLoading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
                     </Button>
                   </div>
                 </div>
