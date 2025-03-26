@@ -12,6 +12,7 @@ import { cn } from "@/lib/utils";
 import { incidentData, type Incident, type IncidentPriority } from '../data/incidentData';
 import { recommendations, type Recommendation } from '../data/recommendationsData';
 import { MCPQuery } from './MCPQuery';
+import { GitHubCommit, githubService } from "@/services/github";
 
 interface Notification {
   message: string;
@@ -638,75 +639,62 @@ export default function IPEConsole() {
   };
 
   const handleSendMessage = async () => {
-    if (!message.trim()) return;
-    try {
-      // Create a Jira issue from the message
-      await createJiraIssue("New Incident Report", message);
-    setMessage("");
-      // Refresh Jira issues
-      fetchJiraIssues();
-    } catch (error) {
-      console.error("Error handling message:", error);
-    }
-  };
+    if (!input.trim()) return;
 
-  const handleSubmit = async () => {
-    if (!input.trim() || isLoading) return;
-    
-    setIsLoading(true);
-    const userMessage = input.trim();
+    const userMessage = input;
     setInput('');
     setMessages(prev => [...prev, { role: 'user', content: userMessage }]);
 
+    setIsLoading(true);
     try {
-      const response = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          message: userMessage,
-          context: selectedIncident ? {
-            incidentId: selectedIncident.id,
-            title: selectedIncident.title,
-            status: selectedIncident.status
-          } : null
-        }),
-      });
-
-      if (!response.ok) throw new Error('Failed to get response');
-      
-      const data = await response.json();
-      setMessages(prev => [...prev, { role: 'assistant', content: data.response }]);
+      // First try GitHub search
+      if (userMessage.toLowerCase().includes('github') || 
+          userMessage.toLowerCase().includes('commit') || 
+          userMessage.toLowerCase().includes('pr') || 
+          userMessage.toLowerCase().includes('issue')) {
+        const results = await githubService.searchGitHub(userMessage);
+        setMessages(prev => [...prev,
+          { role: 'assistant', content: 'Here are the GitHub search results:\n\n' + results.map((commit: any) => 
+            `📝 ${new Date(commit.commit.author.date).toLocaleDateString()} - ${commit.commit.message} (by ${commit.commit.author.name})`
+          ).join('\n\n')}
+        ]);
+      } else {
+        // Handle other types of queries
+        setMessages(prev => [...prev, 
+          { role: 'assistant', content: 'I understand you\'re asking about: ' + userMessage }
+        ]);
+      }
     } catch (error) {
-      console.error('Error:', error);
-      setMessages(prev => [...prev, { 
-        role: 'assistant', 
-        content: 'Sorry, I encountered an error. Please try again.' 
-      }]);
+      console.error("Error processing message:", error);
+      setMessages(prev => [...prev,
+        { role: 'assistant', content: 'Sorry, I encountered an error while processing your request. Please try again.' }
+      ]);
     } finally {
       setIsLoading(false);
     }
   };
 
-  const handleSearch = (term: string) => {
-    setSearchTerm(term);
-    if (!term.trim()) {
-      setFilteredIncidents(activeIncidents);
-      return;
+  const handleSearch = async (query: string) => {
+    if (!query.trim()) return;
+    
+    setIsLoading(true);
+    try {
+      const results = await githubService.searchGitHub(query);
+      setMessages(prev => [...prev,
+        { role: 'user', content: query },
+        { role: 'assistant', content: 'Here are the GitHub search results:\n\n' + results.map((commit: any) => 
+          `📝 ${new Date(commit.commit.author.date).toLocaleDateString()} - ${commit.commit.message} (by ${commit.commit.author.name})`
+        ).join('\n\n')}
+      ]);
+    } catch (error) {
+      console.error("Search error:", error);
+      setMessages(prev => [...prev,
+        { role: 'user', content: query },
+        { role: 'assistant', content: 'Sorry, I encountered an error while searching GitHub. Please try again.' }
+      ]);
+    } finally {
+      setIsLoading(false);
     }
-
-    const searchLower = term.toLowerCase();
-    const filtered = activeIncidents.filter(incident => {
-      const priority = getPriority(incident.priority);
-      return incident.title.toLowerCase().includes(searchLower) ||
-        incident.id.toLowerCase().includes(searchLower) ||
-        incident.status.toLowerCase().includes(searchLower) ||
-        priority.toLowerCase().includes(searchLower) ||
-        incident.assignedTeam.toLowerCase().includes(searchLower) ||
-        incident.affectedServices.some(service => 
-          service.toLowerCase().includes(searchLower)
-        );
-    });
-    setFilteredIncidents(filtered);
   };
 
   const getPriority = (priority: string): IncidentPriority => {
@@ -808,6 +796,59 @@ export default function IPEConsole() {
   };
 
   const [isMCPModalOpen, setIsMCPModalOpen] = useState(false);
+
+  const [githubSearchTerm, setGithubSearchTerm] = useState("");
+  const [githubSearchResults, setGithubSearchResults] = useState<GitHubCommit[]>([]);
+  const [githubSearchLoading, setGithubSearchLoading] = useState(false);
+
+  const handleGitHubSearch = async (query: string) => {
+    if (!query.trim()) return;
+    
+    setGithubSearchLoading(true);
+    try {
+      const results = await githubService.searchGitHub(query);
+      setGithubSearchResults(results);
+    } catch (error) {
+      console.error("Search error:", error);
+      // Add error notification
+      setNotifications(prev => [...prev, {
+        message: "Error performing search. Please try again."
+      }]);
+    } finally {
+      setGithubSearchLoading(false);
+    }
+  };
+
+  const renderGitHubSearchResults = () => {
+    if (githubSearchLoading) {
+      return <div className="text-gray-400">Searching...</div>;
+    }
+
+    if (!githubSearchResults.length) {
+      return <div className="text-gray-400">No results found</div>;
+    }
+
+    return (
+      <div className="space-y-2">
+        {githubSearchResults.map((commit) => (
+          <div key={commit.sha} className="bg-gray-800 rounded-lg p-3">
+            <div className="flex items-center gap-2">
+              <span className="text-blue-400">📝</span>
+              <span className="text-sm text-gray-300">
+                {new Date(commit.commit.author.date).toLocaleDateString()}
+              </span>
+              <span className="text-sm text-white">
+                {commit.commit.message}
+              </span>
+            </div>
+            <div className="mt-1 text-xs text-gray-400">
+              by {commit.commit.author.name}
+            </div>
+          </div>
+        ))}
+      </div>
+    );
+  };
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-900 to-gray-800 text-white">
@@ -1246,13 +1287,13 @@ export default function IPEConsole() {
                       onKeyPress={(e) => {
                         if (e.key === 'Enter' && !e.shiftKey) {
                           e.preventDefault();
-                          handleSubmit();
+                          handleSendMessage();
                         }
                       }}
                     />
                     <Button 
                       className="bg-blue-600 hover:bg-blue-700 text-white"
-                      onClick={handleSubmit}
+                      onClick={handleSendMessage}
                       disabled={isLoading || !input.trim()}
                     >
                       {isLoading ? <RefreshCw className="w-4 h-4 animate-spin" /> : 'Send'}
